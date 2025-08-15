@@ -1,154 +1,216 @@
-// /api/bella.js — Edge Function (quick-return + robust errors)
-export const config = { runtime: 'edge' };
+// api/bella.js — Robust Node serverless proxy for Bella
+// - Accepts text/plain or application/json
+// - Tries multiple Relevance API hosts & auth formats
+// - Triggers via tasks API, then classic agents API, then your custom-trigger webhook
+// - Returns { reply } when available, else { pending:true, conversation_id }
 
-export default async function handler(req) {
-  // ----- CORS -----
-  const reqAllow = req.headers.get('Access-Control-Request-Headers') || 'Content-Type, Authorization, Accept';
-  const cors = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': reqAllow,
-    'Access-Control-Expose-Headers': 'Content-Type',
-    'Vary': 'Origin, Access-Control-Request-Headers, Access-Control-Request-Method',
-  };
-  if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: cors });
-  if (req.method !== 'POST')   return json({ error: 'Method not allowed' }, 405, cors);
+const AGENT_ID  = process.env.RELEVANCE_AGENT_ID;           // e.g. "1ecb9fa6-723e-4f5c-b5d8-051246d4cdf4"
+const PROJECT   = process.env.RELEVANCE_PROJECT;             // e.g. "bcbe5a"  (IMPORTANT: this is NOT "usa")
+const REGION    = process.env.RELEVANCE_REGION || "usa";     // e.g. "usa" (or your cluster label)
+const API_KEY   = process.env.RELEVANCE_API_KEY;             // project API key w/ agents:trigger permission
+const CUSTOM_TRIGGER = process.env.RELEVANCE_CUSTOM_TRIGGER; // optional: your working custom-trigger URL
+
+// Build candidate hosts (we'll try both)
+const HOSTS = [];
+if (PROJECT) HOSTS.push(`https://api-${PROJECT}.stack.tryrelevance.com`);
+if (REGION)  HOSTS.push(`https://api-${REGION}.stack.tryrelevance.com`);
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+  "Access-Control-Max-Age": "86400",
+  "Vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+};
+
+module.exports = async (req, res) => {
+  if (req.method === "OPTIONS") { setCors(res); res.statusCode = 204; return res.end(); }
+  if (req.method !== "POST")     { return send(res, 405, { error: "Method not allowed" }); }
 
   try {
-    const body = await readBody(req); // supports text/plain or application/json
+    const body = await readBody(req);
     const {
-      message, thread_id, marketing_consent, customer, context,
+      message, thread_id, unique_id, channel, context, customer, marketing_consent,
       status_only, conversation_id
     } = body || {};
 
-    // ----- ENV (validate clearly) -----
-    const env = (globalThis.process && process.env) ? process.env : {};
-    const REGION   = env.RELEVANCE_REGION || '';       // e.g. "bcbe5a" (must match your webhook host)
-    const PROJECT  = env.RELEVANCE_PROJECT_ID || '';   // your real project id (NOT the region)
-    const API_KEY  = env.RELEVANCE_API_KEY || '';      // your API key
-    const AGENT_ID = env.RELEVANCE_AGENT_ID || '';     // your agent id (UUID)
-
+    // Validate env
     const missing = [];
-    if (!REGION)   missing.push('RELEVANCE_REGION');
-    if (!PROJECT)  missing.push('RELEVANCE_PROJECT_ID');
-    if (!API_KEY)  missing.push('RELEVANCE_API_KEY');
-    if (!AGENT_ID) missing.push('RELEVANCE_AGENT_ID');
-    if (missing.length) {
-      return json(
-        { error: 'Missing required environment variables', missing, hint:
-          'REGION must match your webhook subdomain; PROJECT is your actual project id; AGENT_ID is your agent UUID.' },
-        500, cors
-      );
-    }
+    if (!API_KEY)  missing.push("RELEVANCE_API_KEY");
+    if (!AGENT_ID) missing.push("RELEVANCE_AGENT_ID");
+    if (!PROJECT)  missing.push("RELEVANCE_PROJECT"); // must be like "bcbe5a"
+    if (missing.length) return send(res, 500, { error: "Missing environment variables", missing });
 
-    // Common misconfig checks with actionable hints
-    if (PROJECT === 'bcbe5a' || PROJECT.toLowerCase() === 'usa') {
-      return json(
-        { error: 'RELEVANCE_PROJECT_ID looks wrong',
-          got: PROJECT,
-          hint: 'PROJECT_ID is NOT the region. Grab it from your Relevance dashboard (Project settings).'
-        },
-        500, cors
-      );
-    }
-
-    const AUTHS = [
-      `${PROJECT}:${API_KEY}:${REGION}`,
-      `${PROJECT}:${API_KEY}`,
-      `${API_KEY}`,
-    ];
-
-    // ----- Client polling path -----
+    // Status-only polling path
     if (status_only) {
-      const convId = conversation_id || thread_id; // allow thread fallback
-      if (!convId) return json({ error: 'Missing conversation_id' }, 400, cors);
-      const got = await quickCheck({ REGION, auths: AUTHS, convId });
-      if (got.reply) return json({ reply: got.reply, conversation_id: convId, pending: false }, 200, cors);
-      return json({ pending: true, conversation_id: convId }, 200, cors);
+      const convId = conversation_id || thread_id;
+      if (!convId) return send(res, 400, { error: "Missing conversation_id" });
+      const poll = await pollForReply({ convId });
+      return send(res, 200, { pending: !poll.reply, reply: poll.reply || null, conversation_id: convId, debug: poll.debug || undefined });
     }
 
-    // ----- Trigger path (fire-and-return quickly) -----
-    if (!message) return json({ error: "Missing 'message' in body" }, 400, cors);
+    // Trigger path
+    if (!message) return send(res, 400, { error: "Missing 'message' in body" });
 
-    const triggerUrl = `https://api-${REGION}.stack.tryrelevance.com/latest/agents/trigger`;
-    const triggerBody = {
+    const payload = {
       agent_id: AGENT_ID,
-      message: { role: 'user', content: message },
-      conversation_id: thread_id, // keeps thread sticky
+      message: typeof message === "string" ? { role: "user", content: message } : message,
+      conversation_id: thread_id,
+      unique_id, channel, context, customer,
       marketing_consent: !!marketing_consent,
-      customer, context,
     };
 
-    let trig, authUsed = AUTHS[0];
-    for (const a of AUTHS) {
-      try {
-        const r = await fetch(triggerUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': a },
-          body: JSON.stringify(triggerBody),
-        });
-        if (r.status !== 401) { trig = r; authUsed = a; break; }
-      } catch { /* try next */ }
-    }
-    if (!trig) return json({ error: 'Failed to contact trigger endpoint' }, 502, cors);
+    const trig = await triggerAgent(payload);
+    if (!trig.ok) return send(res, trig.status || 502, { error: "Trigger failed", detail: trig.error || trig.text || null });
 
-    const trigText = await trig.text().catch(()=> '');
-    let trigJson = {}; try { trigJson = JSON.parse(trigText || '{}'); } catch {}
+    const convId = trig.conversation_id || thread_id || null;
+    if (trig.reply) return send(res, 200, { reply: trig.reply, pending: false, conversation_id: convId });
 
-    // Inline reply (sometimes present)
-    const inline =
-      trigJson.assistant_reply || trigJson.reply || trigJson.output ||
-      (trigJson.data && (trigJson.data.reply || trigJson.data.output));
-    if (inline) return json({ reply: inline, pending: false }, 200, cors);
-
-    // Not inline → give client something to poll with
-    const convId =
-      trigJson.conversation_id || trigJson.conversationId || trigJson.task_id || trigJson.id || thread_id || null;
-
-    if (!trig.ok && trig.status !== 202 && trig.status !== 409) {
-      return json({ error: 'Trigger failed', status: trig.status, body: trigText.slice(0,800) }, trig.status, cors);
-    }
-
-    return json({ pending: true, conversation_id: convId }, 200, cors);
-  } catch (err) {
-    return json({ error: 'Unhandled server error', details: String(err) }, 500, cors);
+    // No inline reply → client will poll using conversation_id (or thread fallback)
+    return send(res, 200, { pending: true, conversation_id: convId });
+  } catch (e) {
+    return send(res, 500, { error: "Unhandled server error", details: String(e) });
   }
-}
+};
 
-// ------------- helpers -------------
-function json(obj, status=200, extra={}) {
-  return new Response(JSON.stringify(obj), {
-    status, headers: new Headers({ 'Content-Type': 'application/json', ...extra })
-  });
+// ---------------- helpers ----------------
+function setCors(res) {
+  Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
 }
-
+function send(res, status, obj) {
+  setCors(res);
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(obj));
+}
 async function readBody(req) {
-  const ct = req.headers.get('content-type') || '';
-  if (ct.includes('application/json')) { try { return await req.json(); } catch {} }
-  try { const t = await req.text(); return JSON.parse(t || '{}'); } catch { return {}; }
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return {}; }
 }
 
-async function quickCheck({ REGION, auths, convId }) {
-  const urls = [
-    `https://api-${REGION}.stack.tryrelevance.com/latest/agents/conversations/${convId}`,
-    `https://api-${REGION}.stack.tryrelevance.com/latest/agents/tasks/${convId}`,
-    `https://api-${REGION}.stack.tryrelevance.com/latest/tasks/${convId}`,
+function authVariants() {
+  return [
+    { Authorization: `${PROJECT}:${API_KEY}:${REGION}` },
+    { Authorization: `${PROJECT}:${API_KEY}` },
+    { Authorization: `Bearer ${API_KEY}` },
+    { Authorization: API_KEY },
   ];
-  for (const a of auths) {
-    for (const url of urls) {
-      try {
-        const r = await fetch(url, { headers: { 'Authorization': a, 'Accept': 'application/json' } });
-        if (!r.ok) continue;
-        const j = await r.json().catch(()=> ({}));
-        const reply =
-          (Array.isArray(j.messages) && j.messages.filter(m => (m.role||'').toLowerCase().includes('assistant')).slice(-1)[0]?.content) ||
-          (j.latest_assistant_message && j.latest_assistant_message.content) ||
-          (j.assistant && j.assistant.message) ||
-          j.assistant_reply || j.reply || j.output ||
-          (j.data && (j.data.reply || j.data.output));
-        if (reply) return { reply };
-      } catch { /* try next */ }
+}
+async function tryFetch(url, init) {
+  try {
+    const r = await fetch(url, init);
+    const text = await r.text();
+    let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+    return { ok: r.ok, status: r.status, text, json };
+  } catch (e) {
+    return { ok: false, status: 0, text: String(e), json: null };
+  }
+}
+
+function extractReply(payload) {
+  if (!payload) return null;
+  // steps[]
+  if (Array.isArray(payload.steps)) {
+    for (let i = payload.steps.length - 1; i >= 0; i--) {
+      const s = payload.steps[i];
+      const cand = s?.assistant_reply || s?.output || s?.message || s?.text;
+      const str = typeof cand === "string" ? cand : (cand && cand.text);
+      if (str && String(str).trim()) return String(str).trim();
     }
   }
-  return {};
+  // messages[]
+  if (Array.isArray(payload.messages)) {
+    for (let i = payload.messages.length - 1; i >= 0; i--) {
+      const m = payload.messages[i];
+      const role = (m.role || m.sender || "").toLowerCase();
+      if (role.includes("assistant")) {
+        const cand = m.text || m.message || m.content || m.output;
+        if (cand && String(cand).trim()) return String(cand).trim();
+      }
+    }
+  }
+  const flat = payload.assistant_reply || payload.reply || payload.output || payload.message || payload.text;
+  if (flat && String(flat).trim()) return String(flat).trim();
+  return null;
+}
+
+async function triggerAgent(body) {
+  const tries = [];
+  // 1) Tasks API trigger
+  for (const host of HOSTS) {
+    if (!host) continue;
+    for (const a of authVariants()) {
+      const r = await tryFetch(`${host}/latest/agents/tasks/trigger`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...a },
+        body: JSON.stringify(body),
+      });
+      tries.push({ host, path: "/latest/agents/tasks/trigger", status: r.status });
+      if (r.ok || r.status === 202 || r.status === 409) {
+        const reply = extractReply(r.json || {});
+        const convId = (r.json && (r.json.conversation_id || r.json.task_id || r.json.id)) || body.conversation_id || null;
+        return { ok: true, status: r.status, reply, conversation_id: convId, debug: tries };
+      }
+      if (r.status === 401 || r.status === 403) continue; // try next auth
+    }
+  }
+  // 2) Classic agents trigger
+  for (const host of HOSTS) {
+    if (!host) continue;
+    for (const a of authVariants()) {
+      const r = await tryFetch(`${host}/latest/agents/trigger`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...a },
+        body: JSON.stringify(body),
+      });
+      tries.push({ host, path: "/latest/agents/trigger", status: r.status });
+      if (r.ok || r.status === 202 || r.status === 409) {
+        const reply = extractReply(r.json || {});
+        const convId = (r.json && (r.json.conversation_id || r.json.task_id || r.json.id)) || body.conversation_id || null;
+        return { ok: true, status: r.status, reply, conversation_id: convId, debug: tries };
+      }
+      if (r.status === 401 || r.status === 403) continue;
+    }
+  }
+  // 3) Fallback: your custom-trigger webhook (fire-and-forget)
+  if (CUSTOM_TRIGGER) {
+    const r = await tryFetch(CUSTOM_TRIGGER, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify(body),
+    });
+    tries.push({ host: CUSTOM_TRIGGER, path: "custom-trigger", status: r.status });
+    if (r.ok) {
+      return { ok: true, status: r.status, reply: null, conversation_id: body.conversation_id || null, debug: tries };
+    }
+    return { ok: false, status: r.status || 502, error: r.text || "Custom-trigger failed", debug: tries };
+  }
+  return { ok: false, status: 502, error: "Failed to contact trigger endpoint", debug: tries };
+}
+
+async function pollForReply({ convId }) {
+  const tries = [];
+  for (const host of HOSTS) {
+    if (!host) continue;
+    for (const a of authVariants()) {
+      const urls = [
+        `${host}/latest/agents/${AGENT_ID}/tasks/${convId}/steps`,
+        `${host}/latest/agents/tasks/view?agent_id=${encodeURIComponent(AGENT_ID)}&conversation_id=${encodeURIComponent(convId)}`,
+        `${host}/latest/agents/conversations/${convId}`,
+        `${host}/latest/agents/tasks/${convId}`,
+        `${host}/latest/tasks/${convId}`,
+      ];
+      for (const url of urls) {
+        const r = await tryFetch(url, { method: "GET", headers: { Accept: "application/json", ...a } });
+        tries.push({ url, status: r.status });
+        if (!r.ok) continue;
+        const reply = extractReply(r.json || {});
+        if (reply) return { reply, debug: tries };
+      }
+    }
+  }
+  return { reply: null, debug: tries };
 }
