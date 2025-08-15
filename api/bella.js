@@ -1,28 +1,30 @@
-// api/bella.js — Node runtime (not Edge)
-// ENV (Production):
+// Node serverless function for Bella proxy (NOT Edge)
+// Uses your cluster host + tenant GUID in headers.
+// Exposes two modes:
+//  - Trigger: POST { message, thread_id, ... }  → { reply?, pending, conversation_id }
+//  - Poll:    POST { status_only:true, conversation_id } → { reply?, pending, debug[] }
+//
+// REQUIRED ENV (Vercel → Settings → Environment Variables → Production):
 //   RELEVANCE_CLUSTER     = bcbe5a
-//   RELEVANCE_TENANT_ID   = 1ecb9fa6-723e-4f5c-b5d8-051246d4cdf4
-//   RELEVANCE_AGENT_ID    = be2c3f28-bb2f-4361-a2df-cfc7cf7add52
-//   RELEVANCE_API_KEY     = sk-XXXXXXXX   (secret ONLY, no tenant prefix)
-//   RELEVANCE_REGION      = usa           (optional)
-//   RELEVANCE_CUSTOM_TRIGGER = <optional webhook fallback>
+//   RELEVANCE_TENANT_ID   = 1ecb9fa6-723e-4f5c-b5d8-051246d4cdf4   // your Project/Workspace GUID
+//   RELEVANCE_AGENT_ID    = be2c3f28-bb2f-4361-a2df-cfc7cf7add52   // your agent id
+//   RELEVANCE_API_KEY     = sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx    // SECRET ONLY (no GUID prefix)
+// OPTIONAL:
+//   RELEVANCE_CUSTOM_TRIGGER = <your custom-trigger URL> (fallback)
 
 const CLUSTER   = process.env.RELEVANCE_CLUSTER;
 const TENANT_ID = process.env.RELEVANCE_TENANT_ID;
 const AGENT_ID  = process.env.RELEVANCE_AGENT_ID;
 const API_KEY   = process.env.RELEVANCE_API_KEY;
-const REGION    = process.env.RELEVANCE_REGION || "usa";
 const CUSTOM_TRIGGER = process.env.RELEVANCE_CUSTOM_TRIGGER || null;
 
-const HOSTS = [
-  CLUSTER ? `https://api-${CLUSTER}.stack.tryrelevance.com` : null,
-  REGION  ? `https://api-${REGION}.stack.tryrelevance.com`  : null,
-].filter(Boolean);
+// Always use your cluster host (avoid api-usa)
+const HOST = `https://api-${CLUSTER}.stack.tryrelevance.com`;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, x-project-id, x-region",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, x-project-id",
   "Access-Control-Max-Age": "86400",
   "Vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
 };
@@ -41,15 +43,22 @@ module.exports = async (req, res) => {
   if (!API_KEY)   missing.push("RELEVANCE_API_KEY (sk-… only)");
   if (missing.length) return send(res, 500, { error:"Missing env vars", missing });
 
+  // Status-only polling (client asks us to check for a reply)
   if (status_only) {
     const convId = conversation_id || thread_id;
     if (!convId) return send(res, 400, { error:"Missing conversation_id" });
     const out = await pollForReply({ convId });
-    return send(res, 200, { pending: !out.reply, reply: out.reply || null, conversation_id: convId, debug: out.debug });
+    return send(res, 200, {
+      pending: !out.reply,
+      reply: out.reply || null,
+      conversation_id: convId,
+      debug: out.debug, // helpful while wiring
+    });
   }
 
   if (!message) return send(res, 400, { error:"Missing 'message' in body" });
 
+  // Ask for synchronous reply if supported
   const payload = {
     agent_id: AGENT_ID,
     message: typeof message === "string" ? { role: "user", content: message } : message,
@@ -73,8 +82,8 @@ function send(res, status, obj){ setCors(res); res.statusCode = status; res.setH
 async function readBody(req){ const chunks=[]; for await (const c of req) chunks.push(c); const raw=Buffer.concat(chunks).toString("utf8"); try{ return raw?JSON.parse(raw):{} }catch{ return {}; } }
 
 function authVariants() {
+  // Use TENANT_ID (GUID) in Authorization + x-project-id
   const base = [
-    { Authorization: `${TENANT_ID}:${API_KEY}:${REGION}` },
     { Authorization: `${TENANT_ID}:${API_KEY}` },
     { Authorization: `Bearer ${API_KEY}` },
     { Authorization: API_KEY },
@@ -82,7 +91,6 @@ function authVariants() {
   return base.map(h => ({
     ...h,
     "x-project-id": TENANT_ID,
-    "x-region": REGION,
     Accept: "application/json",
     "Content-Type": "application/json",
   }));
@@ -101,7 +109,7 @@ async function tryFetch(url, init){
 
 function extractReply(p){
   if (!p) return null;
-  // steps
+  // Task steps / tool outputs
   if (Array.isArray(p.steps)) {
     for (let i=p.steps.length-1; i>=0; i--){
       const s=p.steps[i];
@@ -115,7 +123,7 @@ function extractReply(p){
       }
     }
   }
-  // messages
+  // Conversation messages
   if (Array.isArray(p.messages)) {
     for (let i=p.messages.length-1; i>=0; i--){
       const m=p.messages[i];
@@ -131,52 +139,42 @@ function extractReply(p){
   return null;
 }
 
-// find any plausible id returned
 function extractId(p){
   if (!p || typeof p !== 'object') return null;
   const keys = ["conversation_id","task_id","id","run_id","job_id"];
   for (const k of keys) if (p[k]) return String(p[k]);
-  // sometimes wrapped
-  if (p.data && typeof p.data === 'object') {
-    for (const k of keys) if (p.data[k]) return String(p.data[k]);
-  }
+  if (p.data && typeof p.data === 'object') for (const k of keys) if (p.data[k]) return String(p.data[k]);
   return null;
 }
 
 async function triggerAgent(body){
   const tries = [];
 
-  // 1) tasks trigger (blocking)
-  for (const host of HOSTS){
-    for (const h of authVariants()){
-      const url = `${host}/latest/agents/tasks/trigger?blocking=true&return_messages=true`;
-      const r = await tryFetch(url, { method:"POST", headers:h, body: JSON.stringify(body) });
-      tries.push({ url, status: r.status });
-      if (r.ok || r.status===202 || r.status===409) {
-        const reply = extractReply(r.json || {});
-        const convId = extractId(r.json) || body.conversation_id || null;
-        return { ok:true, status:r.status, reply, conversation_id: convId, debug: tries };
-      }
-      if (r.status===401 || r.status===403) continue;
+  // Prefer tasks trigger (blocking)
+  for (const h of authVariants()){
+    const url = `${HOST}/latest/agents/tasks/trigger?blocking=true&return_messages=true`;
+    const r = await tryFetch(url, { method:"POST", headers:h, body: JSON.stringify(body) });
+    tries.push({ url, status: r.status });
+    if (r.ok || r.status===202 || r.status===409) {
+      const reply = extractReply(r.json || {});
+      const convId = extractId(r.json) || body.conversation_id || null;
+      return { ok:true, status:r.status, reply, conversation_id: convId, debug: tries };
     }
   }
 
-  // 2) classic trigger (blocking)
-  for (const host of HOSTS){
-    for (const h of authVariants()){
-      const url = `${host}/latest/agents/trigger?blocking=true&return_messages=true`;
-      const r = await tryFetch(url, { method:"POST", headers:h, body: JSON.stringify(body) });
-      tries.push({ url, status: r.status });
-      if (r.ok || r.status===202 || r.status===409) {
-        const reply = extractReply(r.json || {});
-        const convId = extractId(r.json) || body.conversation_id || null;
-        return { ok:true, status:r.status, reply, conversation_id: convId, debug: tries };
-      }
-      if (r.status===401 || r.status===403) continue;
+  // Classic agents trigger (blocking)
+  for (const h of authVariants()){
+    const url = `${HOST}/latest/agents/trigger?blocking=true&return_messages=true`;
+    const r = await tryFetch(url, { method:"POST", headers:h, body: JSON.stringify(body) });
+    tries.push({ url, status: r.status });
+    if (r.ok || r.status===202 || r.status===409) {
+      const reply = extractReply(r.json || {});
+      const convId = extractId(r.json) || body.conversation_id || null;
+      return { ok:true, status:r.status, reply, conversation_id: convId, debug: tries };
     }
   }
 
-  // 3) fallback to your custom-trigger
+  // Fallback to your custom-trigger (fire-and-forget)
   if (CUSTOM_TRIGGER){
     const r = await tryFetch(CUSTOM_TRIGGER, { method:"POST", headers:{ "Content-Type":"text/plain" }, body: JSON.stringify(body) });
     tries.push({ url: CUSTOM_TRIGGER, status: r.status });
@@ -189,23 +187,21 @@ async function triggerAgent(body){
 
 async function pollForReply({ convId }){
   const tries = [];
-  for (const host of HOSTS){
-    for (const h of authVariants()){
-      const urls = [
-        `${host}/latest/agents/${AGENT_ID}/tasks/${convId}/steps`,
-        `${host}/latest/agents/tasks/view?agent_id=${encodeURIComponent(AGENT_ID)}&conversation_id=${encodeURIComponent(convId)}`,
-        `${host}/latest/agents/conversations/${convId}`,
-        `${host}/latest/agents/${AGENT_ID}/conversations/${convId}`,
-        `${host}/latest/agents/tasks/${convId}`,
-        `${host}/latest/tasks/${convId}`,
-      ];
-      for (const url of urls){
-        const r = await tryFetch(url, { method:"GET", headers:h });
-        tries.push({ url, status: r.status });
-        if (!r.ok) continue;
-        const reply = extractReply(r.json || {});
-        if (reply) return { reply, debug: tries };
-      }
+  const urls = [
+    `${HOST}/latest/agents/${AGENT_ID}/tasks/${convId}/steps`,
+    `${HOST}/latest/agents/tasks/view?agent_id=${encodeURIComponent(AGENT_ID)}&conversation_id=${encodeURIComponent(convId)}`,
+    `${HOST}/latest/agents/conversations/${convId}`,
+    `${HOST}/latest/agents/${AGENT_ID}/conversations/${convId}`,
+    `${HOST}/latest/agents/tasks/${convId}`,
+    `${HOST}/latest/tasks/${convId}`,
+  ];
+  for (const h of authVariants()){
+    for (const url of urls){
+      const r = await tryFetch(url, { method:"GET", headers:h });
+      tries.push({ url, status: r.status });
+      if (!r.ok) continue;
+      const reply = extractReply(r.json || {});
+      if (reply) return { reply, debug: tries };
     }
   }
   return { reply: null, debug: tries };
